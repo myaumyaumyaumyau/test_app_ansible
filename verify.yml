@@ -1,0 +1,108 @@
+---
+# Проверка результата после site.yml:
+#   ansible-playbook -i <IP>, -u <user> verify.yml
+- name: Verify host state
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Docker Compose plugin is installed
+      ansible.builtin.command: docker compose version
+      register: t_compose
+      changed_when: false
+      failed_when: "'Docker Compose version' not in t_compose.stdout"
+
+    - name: Read daemon.json
+      ansible.builtin.slurp:
+        src: /etc/docker/daemon.json
+      register: t_daemon_raw
+
+    - name: Log rotation is configured
+      vars:
+        daemon: "{{ t_daemon_raw.content | b64decode | from_json }}"
+      ansible.builtin.assert:
+        that:
+          - daemon['log-driver'] == 'json-file'
+          - daemon['log-opts']['max-size'] == docker_log_max_size
+          - daemon['log-opts']['max-file'] == docker_log_max_file
+        quiet: true
+
+    - name: Docker uses the configured logging driver
+      ansible.builtin.command: docker info --format '{% raw %}{{.LoggingDriver}}{% endraw %}'
+      register: t_logdriver
+      changed_when: false
+      failed_when: t_logdriver.stdout != 'json-file'
+
+    - name: Prune cron job exists
+      ansible.builtin.command: crontab -l -u root
+      register: t_cron
+      changed_when: false
+      failed_when: "'docker system prune -f' not in t_cron.stdout"
+
+    - name: Read iptables rules
+      ansible.builtin.command: "iptables -S {{ item }}"
+      loop: [INPUT, DOCKER-USER]
+      register: t_iptables
+      changed_when: false
+
+    - name: Firewall opens only expected ports
+      vars:
+        input_rules: "{{ t_iptables.results[0].stdout }}"
+        docker_rules: "{{ t_iptables.results[1].stdout }}"
+      ansible.builtin.assert:
+        that:
+          - "'-P INPUT DROP' in input_rules"
+          - "('--dport ' ~ firewall_ssh_port) in input_rules"
+          - "('--dport ' ~ app_port) in input_rules"
+          - "'5432' not in input_rules"
+          - "('--ctorigdstport ' ~ app_port) in docker_rules"
+        quiet: true
+
+    - name: Containers are healthy
+      community.docker.docker_container_info:
+        name: "{{ item }}"
+      loop:
+        - "{{ app_project_name }}-db-1"
+        - "{{ app_project_name }}-app-1"
+      register: t_containers
+
+    - name: Check container health status
+      ansible.builtin.assert:
+        that:
+          - item.container.State.Running
+          - item.container.State.Health.Status == 'healthy'
+        quiet: true
+      loop: "{{ t_containers.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: API responds
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/{{ item }}"
+        status_code: 200
+      loop: [healthz, readyz, api/notes]
+
+- name: Verify ports from the controller
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: App port is reachable
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ app_port }}"
+        timeout: 10
+      delegate_to: localhost
+
+    - name: Postgres port is closed from outside
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 5432
+        timeout: 3
+      delegate_to: localhost
+      register: t_pg
+      ignore_errors: true
+
+    - name: Postgres must be unreachable
+      ansible.builtin.assert:
+        that: t_pg is failed
+        quiet: true

@@ -1,0 +1,4 @@
+---
+ansible_user: ubuntu
+
+app_log_level: DEBUG

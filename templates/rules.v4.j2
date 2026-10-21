@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:DOCKER-USER - [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+{% if firewall_allow_icmp_ping %}
+-A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/second --limit-burst 10 -j ACCEPT
+{% endif %}
+-A INPUT -p udp --sport 67 --dport 68 -j ACCEPT
+{% for port in firewall_allowed_tcp_ports %}
+-A INPUT -p tcp --dport {{ port }} -m conntrack --ctstate NEW -j ACCEPT
+{% endfor %}
+-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+{% for port in firewall_docker_published_ports %}
+-A DOCKER-USER -i {{ firewall_external_interface }} -p tcp -m conntrack --ctorigdstport {{ port }} -j RETURN
+{% endfor %}
+-A DOCKER-USER -i {{ firewall_external_interface }} -j DROP
+-A DOCKER-USER -j RETURN
+COMMIT

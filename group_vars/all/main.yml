@@ -1,0 +1,115 @@
+---
+# ===== Система =====
+system_upgrade: true
+system_reboot_if_required: true
+system_reboot_timeout: 900
+system_apt_lock_timeout: 300
+system_base_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - rsync
+  - git
+  - cron
+  - python3-docker
+  - python3-debian
+
+# ===== Docker =====
+docker_apt_gpg_key_url: https://download.docker.com/linux/ubuntu/gpg
+docker_apt_keyring_path: /etc/apt/keyrings/docker.asc
+docker_apt_repo_url: https://download.docker.com/linux/ubuntu
+docker_apt_arch: "{{ 'arm64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+docker_conflicting_packages:
+  - docker.io
+  - docker-doc
+  - docker-compose
+  - docker-compose-v2
+  - podman-docker
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+docker_package_state: present
+
+# Ротация json-логов контейнеров
+docker_log_driver: json-file
+docker_log_max_size: 10m
+docker_log_max_file: "3"
+docker_daemon_config:
+  log-driver: "{{ docker_log_driver }}"
+  log-opts:
+    max-size: "{{ docker_log_max_size }}"
+    max-file: "{{ docker_log_max_file }}"
+
+# Ежедневная чистка Docker (cron)
+docker_prune_cron_enabled: true
+docker_prune_cron_hour: "3"
+docker_prune_cron_minute: "0"
+docker_prune_command: /usr/bin/docker system prune -f
+
+# ===== Приложение =====
+app_project_name: notes
+app_dir: /opt/notes
+# Источник кода приложения:
+#   git   — хост сам клонирует app_repo_url (по умолчанию)
+#   local — копируется папка app_src_dir с контроллера
+app_source: git
+app_repo_url: "https://github.com/myaumyaumyaumyau/test_app.git"
+app_repo_version: master
+app_src_dir: "{{ playbook_dir }}/files/notes-app"
+app_required_files:
+  - Dockerfile
+  - docker-compose.yml
+  - requirements.txt
+  - entrypoint.sh
+  - app
+  - scripts
+app_sync_excludes:
+  - .git
+  - .env
+  - .venv
+  - __pycache__
+  - "*.pyc"
+
+app_port: 8000
+app_log_level: INFO
+app_shutdown_delay_seconds: 3
+app_db_wait_timeout: 60
+app_postgres_db: notes
+app_postgres_user: notes
+# Пароль: vault_app_postgres_password (vault или -e). Если не задан, генерируется один раз
+# и сохраняется на контроллере в .credentials/<хост>/ (в git не попадает).
+app_postgres_password: >-
+  {{ vault_app_postgres_password
+     if vault_app_postgres_password is defined
+     else lookup('ansible.builtin.password',
+                 playbook_dir ~ '/.credentials/' ~ inventory_hostname ~ '/postgres_password',
+                 length=24, chars=['ascii_letters', 'digits']) }}
+
+app_compose_wait_timeout: 180
+app_readiness_retries: 20
+app_readiness_delay: 3
+
+# ===== Старые контейнеры =====
+# none        — ничего не трогать
+# conflicting — удалить чужие контейнеры, которые занимают app_port или названы в legacy_container_names
+# all         — удалить все контейнеры, не принадлежащие проекту app_project_name
+legacy_containers_policy: conflicting
+legacy_container_names: []
+legacy_stop_timeout: 30
+
+# ===== Firewall (iptables, persistent) =====
+firewall_enabled: true
+firewall_ipv6: true
+firewall_ssh_port: 22
+firewall_allow_icmp_ping: true
+firewall_allowed_tcp_ports:
+  - "{{ firewall_ssh_port }}"
+  - "{{ app_port }}"
+# Порты, публикуемые Docker'ом, которые разрешены снаружи (цепочка DOCKER-USER)
+firewall_docker_published_ports:
+  - "{{ app_port }}"
+# Внешний интерфейс; пусто = интерфейс маршрута по умолчанию
+firewall_external_interface: "{{ ansible_facts.default_ipv4.interface | default('') }}"

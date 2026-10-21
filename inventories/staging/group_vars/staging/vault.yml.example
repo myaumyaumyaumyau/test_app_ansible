@@ -1,0 +1,3 @@
+---
+# cp vault.yml.example vault.yml && ansible-vault encrypt vault.yml
+vault_app_postgres_password: "change-me-please"

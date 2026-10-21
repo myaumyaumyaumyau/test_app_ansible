@@ -1,0 +1,341 @@
+---
+- name: Bootstrap - Python for Ansible modules
+  hosts: all
+  gather_facts: false
+  become: true
+  tags: [bootstrap]
+  tasks:
+    - name: Check that python3 and python3-apt are installed
+      ansible.builtin.raw: >-
+        test -x /usr/bin/python3 &&
+        dpkg-query -W -f='${Status}' python3-apt 2>/dev/null | grep -q 'install ok installed'
+      register: bootstrap_python_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install python3 and python3-apt (raw)
+      ansible.builtin.raw: |
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get -o DPkg::Lock::Timeout=300 update -qq
+        apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3 python3-apt
+      when: bootstrap_python_check.rc != 0
+      changed_when: true
+
+- name: Deploy Notes application
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    # ------------------------------------------------------------------ checks
+    - name: Check platform
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_version is version('22.04', '>=')
+        fail_msg: This playbook supports Ubuntu 22.04+ only
+        quiet: true
+      tags: [always]
+
+    - name: Check database password
+      ansible.builtin.assert:
+        that:
+          - app_postgres_password | length >= 8
+          - "\"'\" not in app_postgres_password"
+        fail_msg: vault_app_postgres_password must be at least 8 characters, without single quotes
+        quiet: true
+      tags: [always]
+
+    - name: Check application repository URL
+      ansible.builtin.assert:
+        that:
+          - app_repo_url | length > 0
+          - "'CHANGE-ME' not in app_repo_url"
+        fail_msg: Set app_repo_url in group_vars/all/main.yml (or -e app_repo_url=...)
+        quiet: true
+      when: app_source == 'git'
+      tags: [always]
+
+    - name: Check application sources on the controller
+      ansible.builtin.stat:
+        path: "{{ app_src_dir }}/{{ item }}"
+      loop: "{{ app_required_files }}"
+      register: app_src_check
+      delegate_to: localhost
+      become: false
+      when: app_source == 'local'
+      tags: [always]
+
+    - name: Fail if application sources are incomplete
+      ansible.builtin.assert:
+        that: app_src_check.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          Missing in {{ app_src_dir }}:
+          {{ app_src_check.results | rejectattr('stat.exists') | map(attribute='item') | list }}
+        quiet: true
+      when: app_source == 'local'
+      tags: [always]
+
+    # ------------------------------------------------------------------ system
+    - name: System update
+      tags: [system]
+      block:
+        - name: Upgrade all packages
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+            upgrade: dist
+            autoremove: true
+            autoclean: true
+            lock_timeout: "{{ system_apt_lock_timeout }}"
+          when: system_upgrade | bool
+
+        - name: Check whether a reboot is required
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: system_reboot_required
+
+        - name: Reboot if required
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ system_reboot_timeout }}"
+          when:
+            - system_reboot_if_required | bool
+            - system_reboot_required.stat.exists
+
+        - name: Install base packages
+          ansible.builtin.apt:
+            name: "{{ system_base_packages }}"
+            state: present
+            lock_timeout: "{{ system_apt_lock_timeout }}"
+
+    # ------------------------------------------------------------------ docker
+    - name: Docker
+      tags: [docker]
+      block:
+        - name: Remove conflicting distro packages
+          ansible.builtin.apt:
+            name: "{{ docker_conflicting_packages }}"
+            state: absent
+            lock_timeout: "{{ system_apt_lock_timeout }}"
+
+        - name: Create apt keyrings directory
+          ansible.builtin.file:
+            path: "{{ docker_apt_keyring_path | dirname }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Download Docker apt GPG key
+          ansible.builtin.get_url:
+            url: "{{ docker_apt_gpg_key_url }}"
+            dest: "{{ docker_apt_keyring_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Add Docker apt repository
+          ansible.builtin.deb822_repository:
+            name: docker
+            types: [deb]
+            uris: "{{ docker_apt_repo_url }}"
+            suites: ["{{ ansible_facts.distribution_release }}"]
+            components: [stable]
+            architectures: ["{{ docker_apt_arch }}"]
+            signed_by: "{{ docker_apt_keyring_path }}"
+            state: present
+          register: docker_repo
+
+        - name: Update apt cache after repository change  # noqa: no-handler
+          ansible.builtin.apt:
+            update_cache: true
+            lock_timeout: "{{ system_apt_lock_timeout }}"
+          when: docker_repo is changed
+
+        - name: Install Docker Engine and Compose plugin
+          ansible.builtin.apt:
+            name: "{{ docker_packages }}"
+            state: "{{ docker_package_state }}"
+            lock_timeout: "{{ system_apt_lock_timeout }}"
+
+        - name: Configure Docker daemon (json-file logging with rotation)
+          ansible.builtin.template:
+            src: daemon.json.j2
+            dest: /etc/docker/daemon.json
+            owner: root
+            group: root
+            mode: "0644"
+          register: docker_daemon_json
+          notify: Restart docker
+
+    # ---------------------------------------------------------------- firewall
+    - name: Firewall (iptables)
+      when: firewall_enabled | bool
+      tags: [firewall]
+      block:
+        - name: Install iptables and persistence package
+          ansible.builtin.apt:
+            name:
+              - iptables
+              - iptables-persistent
+            state: present
+            lock_timeout: "{{ system_apt_lock_timeout }}"
+
+        - name: Check external interface
+          ansible.builtin.assert:
+            that: firewall_external_interface | length > 0
+            fail_msg: Cannot detect external interface, set firewall_external_interface
+            quiet: true
+
+        - name: Write IPv4 rules
+          ansible.builtin.template:
+            src: rules.v4.j2
+            dest: /etc/iptables/rules.v4
+            owner: root
+            group: root
+            mode: "0640"
+          notify:
+            - Reload firewall
+            - Restart docker
+
+        - name: Write IPv6 rules
+          ansible.builtin.template:
+            src: rules.v6.j2
+            dest: /etc/iptables/rules.v6
+            owner: root
+            group: root
+            mode: "0640"
+          when: firewall_ipv6 | bool
+          notify:
+            - Reload firewall
+            - Restart docker
+
+        - name: Enable rules restore on boot
+          ansible.builtin.systemd:
+            name: netfilter-persistent
+            enabled: true
+
+    - name: Apply pending Docker and firewall changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure Docker is running
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+      tags: [docker]
+
+    # ------------------------------------------------------- legacy containers
+    - name: Legacy containers
+      when: legacy_containers_policy != 'none'
+      tags: [legacy]
+      block:
+        - name: Gather existing containers
+          community.docker.docker_host_info:
+            containers: true
+            containers_all: true
+            verbose_output: true
+          register: docker_host_state
+
+        - name: Remove legacy containers (volumes are kept)
+          community.docker.docker_container:
+            name: "{{ item.Id }}"
+            state: absent
+            stop_timeout: "{{ legacy_stop_timeout }}"
+            keep_volumes: true
+          loop: "{{ docker_host_state.containers }}"
+          loop_control:
+            label: "{{ item.Names | first }}"
+          when:
+            - (item.Labels | default({})).get('com.docker.compose.project', '') != app_project_name
+            - >-
+              legacy_containers_policy == 'all'
+              or (item.Names | map('regex_replace', '^/', '') | intersect(legacy_container_names) | length > 0)
+              or (item.Ports | default([]) | selectattr('PublicPort', 'defined')
+                  | selectattr('PublicPort', 'equalto', app_port | int) | list | length > 0)
+
+    # --------------------------------------------------------------------- app
+    - name: Application
+      tags: [app]
+      block:
+        - name: Create application directory
+          ansible.builtin.file:
+            path: "{{ app_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Clone application repository
+          ansible.builtin.git:
+            repo: "{{ app_repo_url }}"
+            dest: "{{ app_dir }}"
+            version: "{{ app_repo_version }}"
+            force: true
+          register: app_git
+          when: app_source == 'git'
+
+        - name: Copy compose project from the controller
+          ansible.posix.synchronize:
+            src: "{{ app_src_dir }}/"
+            dest: "{{ app_dir }}/"
+            archive: true
+            owner: false
+            group: false
+            checksum: true
+            delete: true
+            rsync_opts: "{{ app_sync_excludes | map('regex_replace', '^(.*)$', '--exclude=\\1') | list }}"
+          register: app_sync
+          when: app_source == 'local'
+
+        - name: Render .env
+          ansible.builtin.template:
+            src: env.j2
+            dest: "{{ app_dir }}/.env"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Build and start the stack
+          community.docker.docker_compose_v2:
+            project_src: "{{ app_dir }}"
+            project_name: "{{ app_project_name }}"
+            state: present
+            build: "{{ 'always' if (app_git is changed or app_sync is changed) else 'policy' }}"
+            pull: missing
+            recreate: "{{ 'always' if docker_daemon_json is changed else 'auto' }}"
+            remove_orphans: true
+            wait: true
+            wait_timeout: "{{ app_compose_wait_timeout }}"
+
+        - name: Wait for application readiness
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ app_port }}/readyz"
+            status_code: 200
+          register: app_readyz
+          until: app_readyz.status == 200
+          retries: "{{ app_readiness_retries }}"
+          delay: "{{ app_readiness_delay }}"
+          changed_when: false
+
+    # -------------------------------------------------------------------- cron
+    - name: Daily docker system prune
+      ansible.builtin.cron:
+        name: docker system prune
+        user: root
+        minute: "{{ docker_prune_cron_minute }}"
+        hour: "{{ docker_prune_cron_hour }}"
+        job: "{{ docker_prune_command }} 2>&1 | /usr/bin/logger -t docker-prune"
+        state: "{{ 'present' if docker_prune_cron_enabled | bool else 'absent' }}"
+      tags: [cron]
+
+  handlers:
+    - name: Reload firewall
+      ansible.builtin.command: /usr/sbin/netfilter-persistent reload
+      changed_when: true
+
+    - name: Restart docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
